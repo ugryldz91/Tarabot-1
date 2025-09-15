@@ -1,0 +1,31 @@
+name: Binance Daily Scan 1 (03:03 TR)
+
+on:
+  schedule:
+    - cron: '45 * * * *'  # 00:03 UTC ~= 03:03 TR
+  workflow_dispatch: {}
+
+jobs:
+  scan:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install aiohttp pandas numpy python-dateutil
+
+      - name: Run scan (v4 with stronger fallbacks)
+        env:
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+          BINANCE_BASES: "https://data-api.binance.vision,https://api-gcp.binance.com,https://data.binance.com,https://api1.binance.com,https://api2.binance.com,https://api3.binance.com,https://api4.binance.com"
+        run: |
+          python binance_scan_v4.py
