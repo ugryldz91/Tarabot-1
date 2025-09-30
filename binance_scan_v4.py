@@ -1,3 +1,20 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+"""
+Binance taraması — PUBLIC endpoints (API key gerekmez)
+
+Kapanan günlük mum için koşullar:
+  1) Wilder RSI(14) < 30
+  2) Close < Bollinger lower (20, 2σ)
+  3) Son gün hacmi > önceki 3 gün ortalamasının 1.8×
+İyileştirmeler (v4):
+- BASE önceliği: data-api.binance.vision → api-gcp → data → api1/2/3/4
+- 6 denemeye kadar exponential backoff + jitter, 429 (rate limit) algılama
+- Timeout ↑ (45→70s), eşzamanlı istek sayısı ↓ (8→4)
+- exchangeInfo başarısızsa ticker/price FALLBACK
+- Mesajda taranan toplam coin sayısı
+"""
+
 import asyncio
 import aiohttp
 import os
@@ -9,7 +26,6 @@ from typing import List, Dict, Any, Tuple, Optional
 import numpy as np
 import pandas as pd
 
-# ------------------- Ayarlar -------------------
 DEFAULT_BASES = [
     "https://data-api.binance.vision",
     "https://api-gcp.binance.com",
@@ -27,26 +43,15 @@ EXCLUDE_KEYWORDS = (
     "UP","DOWN","BULL","BEAR","2L","2S","3L","3S","4L","4S","5L","5S","PERP"
 )
 
-# ------------------- Pine Script RMA (Wilder EMA) -------------------
-def rma(series: pd.Series, period: int) -> pd.Series:
-    result = pd.Series(index=series.index, dtype=float)
-    for i, val in enumerate(series):
-        if i == 0:
-            result.iloc[i] = val
-        else:
-            result.iloc[i] = (val + (period - 1) * result.iloc[i-1]) / period
-    return result
-
+# ---------- Indicators ----------
 def wilder_rsi(close: pd.Series, period: int = 14) -> pd.Series:
     delta = close.diff()
     gain = delta.clip(lower=0.0)
     loss = -delta.clip(upper=0.0)
-    avg_gain = rma(gain, period)
-    avg_loss = rma(loss, period)
-    rs = avg_gain / avg_loss.replace(0, np.nan)
-    rsi = 100 - (100 / (1 + rs))
-    rsi = rsi.fillna(0)
-    return rsi
+    roll_up = gain.ewm(alpha=1/period, adjust=False).mean()
+    roll_down = loss.ewm(alpha=1/period, adjust=False).mean().replace(0, 1e-12)
+    rs = roll_up / roll_down
+    return 100.0 - (100.0 / (1.0 + rs))
 
 def bollinger_bands(close: pd.Series, period: int = 20, num_std: float = 2.0):
     ma = close.rolling(window=period, min_periods=period).mean()
@@ -55,7 +60,7 @@ def bollinger_bands(close: pd.Series, period: int = 20, num_std: float = 2.0):
     lower = ma - num_std * std
     return lower, ma, upper
 
-# ------------------- HTTP helpers -------------------
+# ---------- HTTP helpers ----------
 async def fetch_json(session: aiohttp.ClientSession, url: str, params: Dict[str, Any] = None) -> Any:
     base_delay = 0.8
     for attempt in range(6):
@@ -63,20 +68,32 @@ async def fetch_json(session: aiohttp.ClientSession, url: str, params: Dict[str,
             async with session.get(url, params=params, headers=UA_HEADERS) as resp:
                 if resp.status == 200:
                     return await resp.json()
+
+                # Rate limit / geçici engel: bekleyip tekrar dene
                 if resp.status == 429:
                     retry_after = resp.headers.get("Retry-After")
-                    sleep_s = base_delay * (2 ** attempt) + random.uniform(0,0.6)
                     if retry_after:
-                        try: sleep_s = float(retry_after)
-                        except: pass
+                        try:
+                            sleep_s = float(retry_after)
+                        except ValueError:
+                            sleep_s = base_delay
+                    else:
+                        sleep_s = base_delay * (2 ** attempt)
+                    sleep_s += random.uniform(0, 0.6)
                     print(f"[warn] 429 rate limit, sleeping {sleep_s:.1f}s")
                     await asyncio.sleep(sleep_s)
                     continue
+
                 txt = await resp.text()
                 print(f"[warn] GET {url} -> {resp.status}, body={txt[:200]}")
+
+        except asyncio.TimeoutError:
+            print(f"[warn] timeout GET {url}")
         except Exception as e:
             print(f"[warn] error GET {url}: {e}")
-        await asyncio.sleep(base_delay * (1.7 ** attempt) + random.uniform(0,0.6))
+
+        sleep_s = base_delay * (1.7 ** attempt) + random.uniform(0, 0.6)
+        await asyncio.sleep(sleep_s)
     raise RuntimeError(f"GET {url} failed after retries.")
 
 async def try_bases(path: str, params: Dict[str, Any] = None, bases: Optional[List[str]] = None) -> Any:
@@ -94,131 +111,133 @@ async def try_bases(path: str, params: Dict[str, Any] = None, bases: Optional[Li
             raise last_err
         raise RuntimeError("No base could be used.")
 
-# ------------------- Symbols -------------------
+# ---------- Symbol sources ----------
+async def get_spot_usdt_symbols_via_exchange_info(bases=None) -> List[str]:
+    # SPOT ile daraltılmış exchangeInfo
+    data = await try_bases("/api/v3/exchangeInfo", params={"permissions": "SPOT"}, bases=bases)
+    out = []
+    for s in data.get("symbols", []):
+        if s.get("status") == "TRADING" and s.get("isSpotTradingAllowed", False) and s.get("quoteAsset") == "USDT":
+            sym = s.get("symbol","")
+            if any(sym.endswith(k) for k in EXCLUDE_KEYWORDS):
+                continue
+            out.append(sym)
+    return sorted(set(out))
+
+async def get_spot_usdt_symbols_via_ticker(bases=None) -> List[str]:
+    # exchangeInfo çalışmazsa ticker/price ile USDT paritelerini çıkar
+    data = await try_bases("/api/v3/ticker/price", bases=bases)
+    out = []
+    for item in data:
+        sym = item.get("symbol","")
+        if sym.endswith("USDT") and not any(sym.endswith(k) for k in EXCLUDE_KEYWORDS):
+            out.append(sym)
+    return sorted(set(out))
+
 async def get_spot_usdt_symbols(bases=None) -> List[str]:
     try:
-        data = await try_bases("/api/v3/exchangeInfo", params={"permissions": "SPOT"}, bases=bases)
-        out = []
-        for s in data.get("symbols", []):
-            if s.get("status") == "TRADING" and s.get("isSpotTradingAllowed", False) and s.get("quoteAsset") == "USDT":
-                sym = s.get("symbol","")
-                if any(sym.endswith(k) for k in EXCLUDE_KEYWORDS): continue
-                out.append(sym)
-        return sorted(set(out))
-    except:
-        data = await try_bases("/api/v3/ticker/price", bases=bases)
-        return sorted({i["symbol"] for i in data if i["symbol"].endswith("USDT") and not any(i["symbol"].endswith(k) for k in EXCLUDE_KEYWORDS)})
+        return await get_spot_usdt_symbols_via_exchange_info(bases=bases)
+    except Exception as e:
+        print(f"[info] exchangeInfo alınamadı, ticker fallback: {e}")
+        return await get_spot_usdt_symbols_via_ticker(bases=bases)
 
-# ------------------- Klines -------------------
+# ---------- Klines ----------
 async def get_klines(symbol: str, limit: int = 80, bases=None) -> pd.DataFrame:
     params = {"symbol": symbol, "interval": "1d", "limit": limit}
     raw = await try_bases("/api/v3/klines", params=params, bases=bases)
     cols = ["openTime","open","high","low","close","volume","closeTime","quoteAssetVolume",
             "numberOfTrades","takerBuyBase","takerBuyQuote","ignore"]
     df = pd.DataFrame(raw, columns=cols)
+    if df.empty:
+        return df
     for c in ["open","high","low","close","volume","quoteAssetVolume","takerBuyBase","takerBuyQuote"]:
         df[c] = pd.to_numeric(df[c], errors="coerce")
     df["openTime"] = pd.to_datetime(df["openTime"], unit="ms", utc=True)
     df["closeTime"] = pd.to_datetime(df["closeTime"], unit="ms", utc=True)
     return df
 
-# ------------------- Tarama Koşulları -------------------
 def check_conditions(df: pd.DataFrame) -> Tuple[bool, float]:
-    if df is None or len(df) < 25: return False, float("nan")
-    close, volume = df["close"], df["volume"]
+    if df is None or len(df) < 25:
+        return (False, float("nan"))
+    close = df["close"]; volume = df["volume"]
     rsi = wilder_rsi(close, 14)
     bb_lower, _, _ = bollinger_bands(close, 20, 2.0)
-    i = len(df)-1
-    last_close, last_rsi, last_bb_lower = close.iloc[i], rsi.iloc[i], bb_lower.iloc[i]
-    if len(volume) < 4 or pd.isna(volume.iloc[i]): return False, float(last_rsi)
+    i = len(df) - 1
+    last_close = close.iloc[i]; last_rsi = rsi.iloc[i]; last_bb_lower = bb_lower.iloc[i]
+    if len(volume) < 4 or pd.isna(volume.iloc[i]):
+        return (False, float(last_rsi) if not pd.isna(last_rsi) else float("nan"))
     prev3 = volume.iloc[i-3:i]
-    if prev3.isna().any(): return False, float(last_rsi)
+    if prev3.isna().any():
+        return (False, float(last_rsi) if not pd.isna(last_rsi) else float("nan"))
     vol_ok = volume.iloc[i] > 1.8 * prev3.mean()
     cond_rsi = (not pd.isna(last_rsi)) and (last_rsi < 30.0)
     cond_bb  = (not pd.isna(last_bb_lower)) and (last_close < last_bb_lower)
-    return bool(cond_rsi and cond_bb and vol_ok), float(last_rsi)
+    return (bool(cond_rsi and cond_bb and vol_ok),
+            float(last_rsi) if not pd.isna(last_rsi) else float("nan"))
 
-# ------------------- Tarama -------------------
+# ---------- Scan ----------
 async def scan_all(bases=None) -> Tuple[List[Tuple[str,float]], int]:
     symbols = await get_spot_usdt_symbols(bases=bases)
     results: List[Tuple[str,float]] = []
-    sem = asyncio.Semaphore(4)
+    sem = asyncio.Semaphore(4)  # eşzamanlılık düşürüldü
+
     async def worker(sym: str):
         async with sem:
             try:
                 df = await get_klines(sym, 80, bases=bases)
                 ok, rsi_val = check_conditions(df)
-                if ok: results.append((sym, round(rsi_val,2)))
+                if ok:
+                    results.append((sym, round(rsi_val, 2)))
             except Exception as e:
                 print(f"[warn] {sym} klines hata: {e}")
+
     await asyncio.gather(*[asyncio.create_task(worker(s)) for s in symbols])
     results.sort(key=lambda x: x[1])
     return results, len(symbols)
 
-# ------------------- BTC/ETH RSI -------------------
-async def get_rsi_for_symbols(symbols: List[str], bases=None) -> Dict[str,float]:
-    results = {}
-    sem = asyncio.Semaphore(4)
-    async def worker(sym):
-        async with sem:
-            try:
-                df = await get_klines(sym, 80, bases=bases)
-                if df is not None and len(df) >= 14:
-                    results[sym] = round(float(wilder_rsi(df["close"],14).iloc[-1]),2)
-            except Exception as e:
-                print(f"[warn] {sym} RSI alınamadı: {e}")
-    await asyncio.gather(*[asyncio.create_task(worker(s)) for s in symbols])
-    return results
-
-# ------------------- Telegram -------------------
+# ---------- Telegram ----------
 async def send_telegram(text: str) -> None:
     token = os.getenv("TELEGRAM_BOT_TOKEN")
     chat_id = os.getenv("TELEGRAM_CHAT_ID")
-    if not token or not chat_id: return print("Telegram env eksik; mesaj gönderilmeyecek.")
+    if not token or not chat_id:
+        print("Telegram env eksik; mesaj gönderilmeyecek.")
+        return
     url = f"https://api.telegram.org/bot{token}/sendMessage"
-    payload = {"chat_id": chat_id,"text":text,"parse_mode":"HTML","disable_web_page_preview":True}
+    payload = {"chat_id": chat_id, "text": text, "parse_mode": "HTML", "disable_web_page_preview": True}
     async with aiohttp.ClientSession(timeout=SESSION_TIMEOUT, headers=UA_HEADERS) as s:
-        try: async with s.post(url, json=payload) as resp: _=await resp.text()
-        except Exception as e: print(f"[warn] telegram send error: {e}")
+        try:
+            async with s.post(url, json=payload) as resp:
+                _ = await resp.text()
+        except Exception as e:
+            print(f"[warn] telegram send error: {e}")
 
-def format_message(pairs: List[Tuple[str,float]], scanned: int, btc_eth_rsi: Dict[str,float]) -> str:
-    lines = []
-    if pairs:
-        lines.append(f"Kriterlere uyan coinler (RSI) — Taranan toplam coin: {scanned}")
-        for sym, r in pairs: lines.append(f"- {sym}: RSI={r}")
-    else:
-        lines.append(f"Bugün kriterlere uygun coin bulunamadı.\nTaranan toplam coin: {scanned}")
-    for s in ["BTCUSDT","ETHUSDT"]:
-        if s in btc_eth_rsi: lines.append(f"{s} RSI={btc_eth_rsi[s]}")
-        else: lines.append(f"{s} RSI alınamadı")
+def format_message(pairs: List[Tuple[str,float]], scanned: int) -> str:
+    if not pairs:
+        return f"Bugün kriterlere uygun coin bulunamadı.\nTaranan toplam coin: {scanned}"
+    lines = [f"Kriterlere uyan coinler (RSI) — Taranan toplam coin: {scanned}"]
+    for sym, r in pairs:
+        lines.append(f"- {sym}: RSI={r}")
     return "\n".join(lines)
 
 def write_csv(pairs: List[Tuple[str,float]], out_dir=".") -> str:
     ts = datetime.now(timezone.utc).astimezone().strftime("%Y-%m-%d")
     path = os.path.join(out_dir, f"scan_results_{ts}.csv")
-    with open(path,"w", newline="", encoding="utf-8") as f:
-        w = csv.writer(f)
-        w.writerow(["symbol","rsi"])
-        for sym, rsi_val in pairs:
-            w.writerow([sym, rsi_val])
+    with open(path, "w", newline="", encoding="utf-8") as f:
+        w = csv.writer(f); w.writerow(["symbol","rsi"])
+        for sym, rsi_val in pairs: w.writerow([sym, rsi_val])
     return path
 
-# ------------------- Main -------------------
+# ---------- Main ----------
 async def main():
     bases_env = os.getenv("BINANCE_BASES")
     bases = [b.strip() for b in bases_env.split(",")] if bases_env else None
     try:
         pairs, scanned = await scan_all(bases=bases)
-        btc_eth_rsi = await get_rsi_for_symbols(["BTCUSDT","ETHUSDT"], bases=bases)
     except Exception as e:
-        msg = f"Binance API erişilemedi: {e}"
-        print(msg)
-        await send_telegram(msg)
-        return
-    msg = format_message(pairs, scanned, btc_eth_rsi)
-    print(msg)
-    write_csv(pairs)
-    await send_telegram(msg)
+        msg = f"Binance API erişilemedi: {e}\nLütfen daha sonra tekrar deneyin veya farklı BASE URL deneyin."
+        print(msg); await send_telegram(msg); return
+    msg = format_message(pairs, scanned); print(msg)
+    write_csv(pairs); await send_telegram(msg)
 
 if __name__ == "__main__":
     asyncio.run(main())
