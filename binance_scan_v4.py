@@ -1,20 +1,3 @@
-#!/usr/bin/env python3
-# -*- coding: utf-8 -*-
-"""
-Binance taraması — PUBLIC endpoints (API key gerekmez)
-
-Kapanan günlük mum için koşullar:
-  1) Wilder RSI(14) < 30
-  2) Close < Bollinger lower (20, 2σ)
-  3) Son gün hacmi > önceki 3 gün ortalamasının 1.8×
-İyileştirmeler (v4):
-- BASE önceliği: data-api.binance.vision → api-gcp → data → api1/2/3/4
-- 6 denemeye kadar exponential backoff + jitter, 429 (rate limit) algılama
-- Timeout ↑ (45→70s), eşzamanlı istek sayısı ↓ (8→4)
-- exchangeInfo başarısızsa ticker/price FALLBACK
-- Mesajda taranan toplam coin sayısı
-"""
-
 import asyncio
 import aiohttp
 import os
@@ -68,8 +51,6 @@ async def fetch_json(session: aiohttp.ClientSession, url: str, params: Dict[str,
             async with session.get(url, params=params, headers=UA_HEADERS) as resp:
                 if resp.status == 200:
                     return await resp.json()
-
-                # Rate limit / geçici engel: bekleyip tekrar dene
                 if resp.status == 429:
                     retry_after = resp.headers.get("Retry-After")
                     if retry_after:
@@ -83,15 +64,12 @@ async def fetch_json(session: aiohttp.ClientSession, url: str, params: Dict[str,
                     print(f"[warn] 429 rate limit, sleeping {sleep_s:.1f}s")
                     await asyncio.sleep(sleep_s)
                     continue
-
                 txt = await resp.text()
                 print(f"[warn] GET {url} -> {resp.status}, body={txt[:200]}")
-
         except asyncio.TimeoutError:
             print(f"[warn] timeout GET {url}")
         except Exception as e:
             print(f"[warn] error GET {url}: {e}")
-
         sleep_s = base_delay * (1.7 ** attempt) + random.uniform(0, 0.6)
         await asyncio.sleep(sleep_s)
     raise RuntimeError(f"GET {url} failed after retries.")
@@ -113,7 +91,6 @@ async def try_bases(path: str, params: Dict[str, Any] = None, bases: Optional[Li
 
 # ---------- Symbol sources ----------
 async def get_spot_usdt_symbols_via_exchange_info(bases=None) -> List[str]:
-    # SPOT ile daraltılmış exchangeInfo
     data = await try_bases("/api/v3/exchangeInfo", params={"permissions": "SPOT"}, bases=bases)
     out = []
     for s in data.get("symbols", []):
@@ -125,7 +102,6 @@ async def get_spot_usdt_symbols_via_exchange_info(bases=None) -> List[str]:
     return sorted(set(out))
 
 async def get_spot_usdt_symbols_via_ticker(bases=None) -> List[str]:
-    # exchangeInfo çalışmazsa ticker/price ile USDT paritelerini çıkar
     data = await try_bases("/api/v3/ticker/price", bases=bases)
     out = []
     for item in data:
@@ -195,6 +171,22 @@ async def scan_all(bases=None) -> Tuple[List[Tuple[str,float]], int]:
     results.sort(key=lambda x: x[1])
     return results, len(symbols)
 
+# ---------- BTC & ETH RSI ----------
+async def get_rsi_for_symbols(symbols: List[str], bases=None) -> Dict[str, float]:
+    results = {}
+    sem = asyncio.Semaphore(4)
+    async def worker(sym):
+        async with sem:
+            try:
+                df = await get_klines(sym, 80, bases=bases)
+                if df is not None and len(df) >= 14:
+                    rsi_val = wilder_rsi(df["close"], 14).iloc[-1]
+                    results[sym] = round(float(rsi_val), 2)
+            except Exception as e:
+                print(f"[warn] {sym} RSI alınamadı: {e}")
+    await asyncio.gather(*[asyncio.create_task(worker(s)) for s in symbols])
+    return results
+
 # ---------- Telegram ----------
 async def send_telegram(text: str) -> None:
     token = os.getenv("TELEGRAM_BOT_TOKEN")
@@ -211,19 +203,29 @@ async def send_telegram(text: str) -> None:
         except Exception as e:
             print(f"[warn] telegram send error: {e}")
 
-def format_message(pairs: List[Tuple[str,float]], scanned: int) -> str:
-    if not pairs:
-        return f"Bugün kriterlere uygun coin bulunamadı.\nTaranan toplam coin: {scanned}"
-    lines = [f"Kriterlere uyan coinler (RSI) — Taranan toplam coin: {scanned}"]
-    for sym, r in pairs:
-        lines.append(f"- {sym}: RSI={r}")
+def format_message(pairs: List[Tuple[str,float]], scanned: int, btc_eth_rsi: Dict[str,float]) -> str:
+    lines = []
+    if pairs:
+        lines.append(f"Kriterlere uyan coinler (RSI) — Taranan toplam coin: {scanned}")
+        for sym, r in pairs:
+            lines.append(f"- {sym}: RSI={r}")
+    else:
+        lines.append(f"Bugün kriterlere uygun coin bulunamadı.\nTaranan toplam coin: {scanned}")
+
+    # BTC ve ETH RSI değerlerini ekle
+    for s in ["BTCUSDT", "ETHUSDT"]:
+        if s in btc_eth_rsi:
+            lines.append(f"{s} RSI={btc_eth_rsi[s]}")
+        else:
+            lines.append(f"{s} RSI alınamadı")
     return "\n".join(lines)
 
 def write_csv(pairs: List[Tuple[str,float]], out_dir=".") -> str:
     ts = datetime.now(timezone.utc).astimezone().strftime("%Y-%m-%d")
     path = os.path.join(out_dir, f"scan_results_{ts}.csv")
     with open(path, "w", newline="", encoding="utf-8") as f:
-        w = csv.writer(f); w.writerow(["symbol","rsi"])
+        w = csv.writer(f)
+        w.writerow(["symbol","rsi"])
         for sym, rsi_val in pairs: w.writerow([sym, rsi_val])
     return path
 
@@ -231,13 +233,20 @@ def write_csv(pairs: List[Tuple[str,float]], out_dir=".") -> str:
 async def main():
     bases_env = os.getenv("BINANCE_BASES")
     bases = [b.strip() for b in bases_env.split(",")] if bases_env else None
+
     try:
         pairs, scanned = await scan_all(bases=bases)
+        btc_eth_rsi = await get_rsi_for_symbols(["BTCUSDT","ETHUSDT"], bases=bases)
     except Exception as e:
         msg = f"Binance API erişilemedi: {e}\nLütfen daha sonra tekrar deneyin veya farklı BASE URL deneyin."
-        print(msg); await send_telegram(msg); return
-    msg = format_message(pairs, scanned); print(msg)
-    write_csv(pairs); await send_telegram(msg)
+        print(msg)
+        await send_telegram(msg)
+        return
+
+    msg = format_message(pairs, scanned, btc_eth_rsi)
+    print(msg)
+    write_csv(pairs)
+    await send_telegram(msg)
 
 if __name__ == "__main__":
     asyncio.run(main())
