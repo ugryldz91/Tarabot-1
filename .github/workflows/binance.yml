@@ -2,9 +2,7 @@ name: Binance Daily Scan 1 (03:03 TR)
 
 on:
   schedule:
-    - cron: '3 0 * * *'
     - cron: '13 0 * * *'
-    - cron: '30 0 * * *'
   workflow_dispatch: {}
 
 jobs:
