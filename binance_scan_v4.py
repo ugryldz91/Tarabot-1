@@ -200,7 +200,7 @@ async def last_closed_rsi(symbol: str, bases=None) -> Optional[float]:
     df = await get_klines(symbol, 80, bases=bases)
     if df is None or len(df) < 15:
         return None
-now_utc = datetime.now(timezone.utc)
+    now_utc = datetime.now(timezone.utc)
     last_idx = len(df) - 1
     last_close_time = df["closeTime"].iloc[last_idx]
     i_cl = last_idx if now_utc >= last_close_time else last_idx - 1
@@ -281,5 +281,5 @@ async def main():
     write_csv(pairs)
     await send_telegram(msg)
 
-if name == "__main__":
+if __name__ == "__main__":
     asyncio.run(main())
