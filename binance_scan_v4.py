@@ -195,6 +195,21 @@ async def scan_all(bases=None) -> Tuple[List[Tuple[str,float]], int]:
     results.sort(key=lambda x: x[1])
     return results, len(symbols)
 
+# ---------- Majors RSI (son kapanan mum) ----------
+async def last_closed_rsi(symbol: str, bases=None) -> Optional[float]:
+    df = await get_klines(symbol, 80, bases=bases)
+    if df is None or len(df) < 15:
+        return None
+now_utc = datetime.now(timezone.utc)
+    last_idx = len(df) - 1
+    last_close_time = df["closeTime"].iloc[last_idx]
+    i_cl = last_idx if now_utc >= last_close_time else last_idx - 1
+    if i_cl < 14:
+        return None
+    rsi_series = wilder_rsi(df["close"], 14)
+    val = rsi_series.iloc[i_cl]
+    return float(round(val, 2)) if not pd.isna(val) else None
+
 # ---------- Telegram ----------
 async def send_telegram(text: str) -> None:
     token = os.getenv("TELEGRAM_BOT_TOKEN")
@@ -211,10 +226,19 @@ async def send_telegram(text: str) -> None:
         except Exception as e:
             print(f"[warn] telegram send error: {e}")
 
-def format_message(pairs: List[Tuple[str,float]], scanned: int) -> str:
+def format_message(pairs: List[Tuple[str,float]], scanned: int, majors: Optional[Dict[str, Optional[float]]] = None) -> str:
+    lines = []
+    if majors is not None:
+        lines.append("Majörler (son kapanan mum RSI):")
+        lines.append(f"- BTCUSDT: RSI={majors.get('BTCUSDT') if majors.get('BTCUSDT') is not None else 'N/A'}")
+        lines.append(f"- ETHUSDT: RSI={majors.get('ETHUSDT') if majors.get('ETHUSDT') is not None else 'N/A'}")
+        lines.append("")  # boş satır
+
     if not pairs:
-        return f"Bugün kriterlere uygun coin bulunamadı.\nTaranan toplam coin: {scanned}"
-    lines = [f"Kriterlere uyan coinler (RSI) — Taranan toplam coin: {scanned}"]
+        lines.append(f"Bugün kriterlere uygun coin bulunamadı.\nTaranan toplam coin: {scanned}")
+        return "\n".join(lines)
+
+    lines.append(f"Kriterlere uyan coinler (RSI) — Taranan toplam coin: {scanned}")
     for sym, r in pairs:
         lines.append(f"- {sym}: RSI={r}")
     return "\n".join(lines)
@@ -232,12 +256,30 @@ async def main():
     bases_env = os.getenv("BINANCE_BASES")
     bases = [b.strip() for b in bases_env.split(",")] if bases_env else None
     try:
+        # Majör RSI'lar (BTC/ETH son kapanan mum)
+        majors: Dict[str, Optional[float]] = {}
+        try:
+            majors["BTCUSDT"] = await last_closed_rsi("BTCUSDT", bases=bases)
+        except Exception as e:
+            print(f"[warn] BTCUSDT RSI alınamadı: {e}")
+            majors["BTCUSDT"] = None
+        try:
+            majors["ETHUSDT"] = await last_closed_rsi("ETHUSDT", bases=bases)
+        except Exception as e:
+            print(f"[warn] ETHUSDT RSI alınamadı: {e}")
+            majors["ETHUSDT"] = None
+
+        # Taramayı yap
         pairs, scanned = await scan_all(bases=bases)
+
     except Exception as e:
         msg = f"Binance API erişilemedi: {e}\nLütfen daha sonra tekrar deneyin veya farklı BASE URL deneyin."
         print(msg); await send_telegram(msg); return
-    msg = format_message(pairs, scanned); print(msg)
-    write_csv(pairs); await send_telegram(msg)
 
-if __name__ == "__main__":
+    msg = format_message(pairs, scanned, majors=majors)
+    print(msg)
+    write_csv(pairs)
+    await send_telegram(msg)
+
+if name == "__main__":
     asyncio.run(main())
