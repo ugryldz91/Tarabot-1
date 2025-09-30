@@ -229,7 +229,7 @@ async def send_telegram(text: str) -> None:
 def format_message(pairs: List[Tuple[str,float]], scanned: int, majors: Optional[Dict[str, Optional[float]]] = None) -> str:
     lines = []
     if majors is not None:
-        lines.append("Majörler (son kapanan mum RSI):")
+        lines.append("(1G) Majörler (son kapanan mum RSI):")
         lines.append(f"- BTCUSDT: RSI={majors.get('BTCUSDT') if majors.get('BTCUSDT') is not None else 'N/A'}")
         lines.append(f"- ETHUSDT: RSI={majors.get('ETHUSDT') if majors.get('ETHUSDT') is not None else 'N/A'}")
         lines.append("")  # boş satır
@@ -238,7 +238,7 @@ def format_message(pairs: List[Tuple[str,float]], scanned: int, majors: Optional
         lines.append(f"Bugün kriterlere uygun coin bulunamadı.\nTaranan toplam coin: {scanned}")
         return "\n".join(lines)
 
-    lines.append(f"Kriterlere uyan coinler (RSI) — Taranan toplam coin: {scanned}")
+    lines.append(f"(1G) Kriterlere uyan coinler (RSI) — Taranan toplam coin: {scanned}")
     for sym, r in pairs:
         lines.append(f"- {sym}: RSI={r}")
     return "\n".join(lines)
