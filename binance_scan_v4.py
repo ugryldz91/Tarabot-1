@@ -9,6 +9,7 @@ from typing import List, Dict, Any, Tuple, Optional
 import numpy as np
 import pandas as pd
 
+# ------------------- Ayarlar -------------------
 DEFAULT_BASES = [
     "https://data-api.binance.vision",
     "https://api-gcp.binance.com",
@@ -26,7 +27,7 @@ EXCLUDE_KEYWORDS = (
     "UP","DOWN","BULL","BEAR","2L","2S","3L","3S","4L","4S","5L","5S","PERP"
 )
 
-# ---------- Pine Script ile birebir RMA (Wilder EMA) ----------
+# ------------------- Pine Script RMA (Wilder EMA) -------------------
 def rma(series: pd.Series, period: int) -> pd.Series:
     result = pd.Series(index=series.index, dtype=float)
     for i, val in enumerate(series):
@@ -54,7 +55,7 @@ def bollinger_bands(close: pd.Series, period: int = 20, num_std: float = 2.0):
     lower = ma - num_std * std
     return lower, ma, upper
 
-# ---------- HTTP helpers ----------
+# ------------------- HTTP helpers -------------------
 async def fetch_json(session: aiohttp.ClientSession, url: str, params: Dict[str, Any] = None) -> Any:
     base_delay = 0.8
     for attempt in range(6):
@@ -93,7 +94,7 @@ async def try_bases(path: str, params: Dict[str, Any] = None, bases: Optional[Li
             raise last_err
         raise RuntimeError("No base could be used.")
 
-# ---------- Symbols ----------
+# ------------------- Symbols -------------------
 async def get_spot_usdt_symbols(bases=None) -> List[str]:
     try:
         data = await try_bases("/api/v3/exchangeInfo", params={"permissions": "SPOT"}, bases=bases)
@@ -108,7 +109,7 @@ async def get_spot_usdt_symbols(bases=None) -> List[str]:
         data = await try_bases("/api/v3/ticker/price", bases=bases)
         return sorted({i["symbol"] for i in data if i["symbol"].endswith("USDT") and not any(i["symbol"].endswith(k) for k in EXCLUDE_KEYWORDS)})
 
-# ---------- Klines ----------
+# ------------------- Klines -------------------
 async def get_klines(symbol: str, limit: int = 80, bases=None) -> pd.DataFrame:
     params = {"symbol": symbol, "interval": "1d", "limit": limit}
     raw = await try_bases("/api/v3/klines", params=params, bases=bases)
@@ -121,6 +122,7 @@ async def get_klines(symbol: str, limit: int = 80, bases=None) -> pd.DataFrame:
     df["closeTime"] = pd.to_datetime(df["closeTime"], unit="ms", utc=True)
     return df
 
+# ------------------- Tarama Koşulları -------------------
 def check_conditions(df: pd.DataFrame) -> Tuple[bool, float]:
     if df is None or len(df) < 25: return False, float("nan")
     close, volume = df["close"], df["volume"]
@@ -136,7 +138,7 @@ def check_conditions(df: pd.DataFrame) -> Tuple[bool, float]:
     cond_bb  = (not pd.isna(last_bb_lower)) and (last_close < last_bb_lower)
     return bool(cond_rsi and cond_bb and vol_ok), float(last_rsi)
 
-# ---------- Scan ----------
+# ------------------- Tarama -------------------
 async def scan_all(bases=None) -> Tuple[List[Tuple[str,float]], int]:
     symbols = await get_spot_usdt_symbols(bases=bases)
     results: List[Tuple[str,float]] = []
@@ -153,7 +155,7 @@ async def scan_all(bases=None) -> Tuple[List[Tuple[str,float]], int]:
     results.sort(key=lambda x: x[1])
     return results, len(symbols)
 
-# ---------- BTC/ETH RSI ----------
+# ------------------- BTC/ETH RSI -------------------
 async def get_rsi_for_symbols(symbols: List[str], bases=None) -> Dict[str,float]:
     results = {}
     sem = asyncio.Semaphore(4)
@@ -168,7 +170,7 @@ async def get_rsi_for_symbols(symbols: List[str], bases=None) -> Dict[str,float]
     await asyncio.gather(*[asyncio.create_task(worker(s)) for s in symbols])
     return results
 
-# ---------- Telegram ----------
+# ------------------- Telegram -------------------
 async def send_telegram(text: str) -> None:
     token = os.getenv("TELEGRAM_BOT_TOKEN")
     chat_id = os.getenv("TELEGRAM_CHAT_ID")
@@ -184,7 +186,8 @@ def format_message(pairs: List[Tuple[str,float]], scanned: int, btc_eth_rsi: Dic
     if pairs:
         lines.append(f"Kriterlere uyan coinler (RSI) — Taranan toplam coin: {scanned}")
         for sym, r in pairs: lines.append(f"- {sym}: RSI={r}")
-    else: lines.append(f"Bugün kriterlere uygun coin bulunamadı.\nTaranan toplam coin: {scanned}")
+    else:
+        lines.append(f"Bugün kriterlere uygun coin bulunamadı.\nTaranan toplam coin: {scanned}")
     for s in ["BTCUSDT","ETHUSDT"]:
         if s in btc_eth_rsi: lines.append(f"{s} RSI={btc_eth_rsi[s]}")
         else: lines.append(f"{s} RSI alınamadı")
@@ -193,14 +196,14 @@ def format_message(pairs: List[Tuple[str,float]], scanned: int, btc_eth_rsi: Dic
 def write_csv(pairs: List[Tuple[str,float]], out_dir=".") -> str:
     ts = datetime.now(timezone.utc).astimezone().strftime("%Y-%m-%d")
     path = os.path.join(out_dir, f"scan_results_{ts}.csv")
-        with open(path,"w", newline="", encoding="utf-8") as f:
+    with open(path,"w", newline="", encoding="utf-8") as f:
         w = csv.writer(f)
         w.writerow(["symbol","rsi"])
         for sym, rsi_val in pairs:
             w.writerow([sym, rsi_val])
     return path
 
-# ---------- Main ----------
+# ------------------- Main -------------------
 async def main():
     bases_env = os.getenv("BINANCE_BASES")
     bases = [b.strip() for b in bases_env.split(",")] if bases_env else None
@@ -208,11 +211,10 @@ async def main():
         pairs, scanned = await scan_all(bases=bases)
         btc_eth_rsi = await get_rsi_for_symbols(["BTCUSDT","ETHUSDT"], bases=bases)
     except Exception as e:
-        msg = f"Binance API erişilemedi: {e}\nLütfen daha sonra tekrar deneyin veya farklı BASE URL deneyin."
+        msg = f"Binance API erişilemedi: {e}"
         print(msg)
         await send_telegram(msg)
         return
-
     msg = format_message(pairs, scanned, btc_eth_rsi)
     print(msg)
     write_csv(pairs)
@@ -220,4 +222,3 @@ async def main():
 
 if __name__ == "__main__":
     asyncio.run(main())
-
