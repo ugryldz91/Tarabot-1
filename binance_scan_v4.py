@@ -188,8 +188,8 @@ def check_conditions(df: pd.DataFrame) -> Tuple[bool, float]:
     if prev3.isna().any():
         return (False, float(last_rsi) if not pd.isna(last_rsi) else float("nan"))
 
-    vol_ok = volume.iloc[i_cl] > 1.8 * prev3.mean()
-    cond_rsi = (not pd.isna(last_rsi)) and (last_rsi < 30.0)
+    vol_ok = volume.iloc[i_cl] > 1.7 * prev3.mean()
+    cond_rsi = (not pd.isna(last_rsi)) and (last_rsi < 35.0)
     cond_bb  = (not pd.isna(last_bb_lower)) and (last_close < last_bb_lower)
 
     return (bool(cond_rsi and cond_bb and vol_ok),
