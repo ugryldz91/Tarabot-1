@@ -230,7 +230,30 @@ async def last_closed_rsi(symbol: str, bases=None) -> Optional[float]:
     val = rsi_series.iloc[i_cl]
     return float(round(val, 2)) if not pd.isna(val) else None
 
-# ---------- Telegram ----------
+# ---------- Telegram (güncellendi: uzun mesajı parçalara böl) ----------
+def _chunk_text_by_lines(text: str, limit: int = 3800) -> List[str]:
+    """
+    Telegram tek mesaj sınırı ~4096 karakter. Güven payıyla 3800 kullanılır.
+    Satır bazlı bölerek formatı korur; satır ortasında kesmeyi minimize eder.
+    """
+    if len(text) <= limit:
+        return [text]
+    parts: List[str] = []
+    buf: List[str] = []
+    sz = 0
+    for line in text.splitlines():
+        ln = len(line) + 1  # '\n'
+        if sz + ln > limit and buf:
+            parts.append("\n".join(buf))
+            buf = [line]
+            sz = ln
+        else:
+            buf.append(line)
+            sz += ln
+    if buf:
+        parts.append("\n".join(buf))
+    return parts
+
 async def send_telegram(text: str) -> None:
     token = os.getenv("TELEGRAM_BOT_TOKEN")
     chat_id = os.getenv("TELEGRAM_CHAT_ID")
@@ -238,13 +261,27 @@ async def send_telegram(text: str) -> None:
         print("Telegram env eksik; mesaj gönderilmeyecek.")
         return
     url = f"https://api.telegram.org/bot{token}/sendMessage"
-    payload = {"chat_id": chat_id, "text": text, "parse_mode": "HTML", "disable_web_page_preview": True}
+
+    parts = _chunk_text_by_lines(text, limit=3800)
+    multi = len(parts) > 1
+
     async with aiohttp.ClientSession(timeout=SESSION_TIMEOUT, headers=UA_HEADERS) as s:
-        try:
-            async with s.post(url, json=payload) as resp:
-                _ = await resp.text()
-        except Exception as e:
-            print(f"[warn] telegram send error: {e}")
+        for idx, p in enumerate(parts, start=1):
+            payload = {
+                "chat_id": chat_id,
+                "text": (f"({idx}/{len(parts)})\n{p}") if multi else p,
+                "parse_mode": "HTML",
+                "disable_web_page_preview": True,
+            }
+            try:
+                async with s.post(url, json=payload) as resp:
+                    _ = await resp.text()
+                    if resp.status != 200:
+                        print(f"[warn] telegram send status={resp.status}")
+            except Exception as e:
+                print(f"[warn] telegram send error: {e}")
+            if multi:
+                await asyncio.sleep(0.2)  # hızlı ardışık gönderimde flood riskini azalt
 
 def format_message(pairs: List[Tuple[str,float]], scanned: int, majors: Optional[Dict[str, Optional[float]]] = None) -> str:
     lines = []
